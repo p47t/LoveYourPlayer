@@ -6,8 +6,25 @@ import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaSync
+import android.media.PlaybackParams
 import android.util.Log
 import android.view.Surface
+import java.nio.ByteBuffer
+
+val MediaFormat.channelMask: Int
+    get() {
+        try {
+            return getInteger(MediaFormat.KEY_CHANNEL_MASK)
+        } catch (_: Exception) {
+            // use channel count
+        }
+        return when (getInteger(MediaFormat.KEY_CHANNEL_COUNT)) {
+            2 -> AudioFormat.CHANNEL_OUT_STEREO
+            6 -> AudioFormat.CHANNEL_OUT_5POINT1
+            else -> AudioFormat.CHANNEL_INVALID
+        }
+    }
 
 class YourPlayer {
     companion object {
@@ -21,10 +38,12 @@ class YourPlayer {
     private var audioTrackIdx = -2
     private var audioTrack: AudioTrack? = null
 
-    private val extractor = MediaExtractor()
+    private val mediaSync = MediaSync()
+    private var extractor = MediaExtractor()
+
     private var activeTracks = 0
 
-    fun init(surface: Surface, dataSource: String) {
+    fun init(outputSurface: Surface, dataSource: String): Boolean {
         try {
             extractor.setDataSource(dataSource)
 
@@ -35,7 +54,10 @@ class YourPlayer {
                     mime.startsWith("video/") -> {
                         videoDec = MediaCodec.createDecoderByType(mime)
                         videoDec?.run {
-                            configure(format, surface, null, 0)
+                            mediaSync.setSurface(outputSurface)
+                            val inputSurface = mediaSync.createInputSurface()
+
+                            configure(format, inputSurface, null, 0)
                             start()
 
                             extractor.selectTrack(i)
@@ -58,7 +80,9 @@ class YourPlayer {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to extract media samples", e)
+            return false
         }
+        return true
     }
 
     private fun processInputSample(extractor: MediaExtractor, dec: MediaCodec) {
@@ -81,17 +105,17 @@ class YourPlayer {
         val obx = dec.dequeueOutputBuffer(bi, 1000)
         when (obx) {
             MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                Log.d(TAG, "INFO_OUTPUT_FORMAT_CHANGED")
+                Log.d(TAG, "Video INFO_OUTPUT_FORMAT_CHANGED")
             }
             MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> {
-                Log.d(TAG, "INFO_OUTPUT_BUFFERS_CHANGED")
+                Log.d(TAG, "Video INFO_OUTPUT_BUFFERS_CHANGED")
             }
             MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                Log.d(TAG, "INFO_TRY_AGAIN_LATER")
+                Log.d(TAG, "Video INFO_TRY_AGAIN_LATER")
                 Thread.yield()
             }
             else -> {
-                dec.releaseOutputBuffer(obx, true)
+                dec.releaseOutputBuffer(obx, 1000 * bi.presentationTimeUs)
             }
         }
         if (bi.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
@@ -100,52 +124,60 @@ class YourPlayer {
         return true
     }
 
+    private fun buildAudioTrack(format: MediaFormat): AudioTrack? {
+        var audioTrack: AudioTrack? = null
+        val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+        val channelMask = format.channelMask
+        if (channelMask != AudioFormat.CHANNEL_INVALID) {
+            val pcmEncoding = format.getInteger(MediaFormat.KEY_PCM_ENCODING)
+            val minBufferSize = AudioTrack.getMinBufferSize(sampleRate, channelMask, pcmEncoding)
+            audioTrack = AudioTrack.Builder().run {
+                setAudioAttributes(AudioAttributes.Builder().run {
+                    setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                    build()
+                })
+                setAudioFormat(AudioFormat.Builder().run {
+                    setSampleRate(sampleRate)
+                    setChannelMask(channelMask)
+                    setEncoding(pcmEncoding)
+                    build()
+                })
+                setBufferSizeInBytes(minBufferSize)
+                setTransferMode(AudioTrack.MODE_STREAM)
+                build()
+            }
+        }
+        return audioTrack
+    }
+
     private fun renderAudioSample(bi: MediaCodec.BufferInfo, dec: MediaCodec): Boolean {
         val obx = dec.dequeueOutputBuffer(bi, 1000)
         when (obx) {
             MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                Log.d(TAG, "INFO_OUTPUT_FORMAT_CHANGED")
-                val format = dec.outputFormat
+                Log.d(TAG, "Audio INFO_OUTPUT_FORMAT_CHANGED")
+                audioTrack = buildAudioTrack(dec.outputFormat)?.apply { play() }
 
-                val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                val channelCount = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                val channelMask = when (channelCount) {
-                    2 -> AudioFormat.CHANNEL_OUT_STEREO
-                    6 -> AudioFormat.CHANNEL_OUT_5POINT1
-                    else -> AudioFormat.CHANNEL_INVALID
-                }
-                if (channelMask != AudioFormat.CHANNEL_INVALID) {
-                    val pcmEncoding = format.getInteger(MediaFormat.KEY_PCM_ENCODING)
-                    val minBufferSize = AudioTrack.getMinBufferSize(sampleRate, channelMask, pcmEncoding)
-                    audioTrack = AudioTrack.Builder().run {
-                        setAudioAttributes(AudioAttributes.Builder().run {
-                            setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                            build()
-                        })
-                        setAudioFormat(AudioFormat.Builder().run {
-                            setSampleRate(sampleRate)
-                            setChannelMask(channelMask)
-                            setEncoding(pcmEncoding)
-                            build()
-                        })
-                        setBufferSizeInBytes(minBufferSize)
-                        setTransferMode(AudioTrack.MODE_STREAM)
-                        build()
-                    }
-                    audioTrack?.play()
+                with(mediaSync) {
+                    setAudioTrack(audioTrack)
+                    setCallback(object : MediaSync.Callback() {
+                        override fun onAudioBufferConsumed(sync: MediaSync?, buf: ByteBuffer?, bufId: Int) {
+                            audioDec?.releaseOutputBuffer(bufId, false)
+                        }
+                    }, null)
+                    // TODO: what will happen if no audio codec?
+                    playbackParams = PlaybackParams().setSpeed(1.0f)
                 }
             }
             MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> {
-                Log.d(TAG, "INFO_OUTPUT_BUFFERS_CHANGED")
+                Log.d(TAG, "Audio INFO_OUTPUT_BUFFERS_CHANGED")
             }
             MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                Log.d(TAG, "INFO_TRY_AGAIN_LATER")
+                Log.d(TAG, "Audio INFO_TRY_AGAIN_LATER")
                 Thread.yield()
             }
             else -> {
                 val ob = dec.getOutputBuffer(obx)
-                audioTrack?.write(ob, ob.limit(), AudioTrack.WRITE_BLOCKING)
-                dec.releaseOutputBuffer(obx, true)
+                mediaSync.queueAudio(ob, obx, bi.presentationTimeUs)
             }
         }
         if (bi.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
@@ -187,18 +219,23 @@ class YourPlayer {
                     }
                 }
 
-                if (activeTracks == 0) {
-                    return // all tracks reached EOS
+                if (activeTracks == 0 || Thread.interrupted()) {
+                    return
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to process sample", e)
         } finally {
+            mediaSync.release()
             videoDec?.stop()
             videoDec?.release()
             audioDec?.stop()
             audioDec?.release()
             extractor.release()
         }
+    }
+
+    fun stop() {
+        activeTracks = 0
     }
 }
