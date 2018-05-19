@@ -13,6 +13,8 @@ class MainActivity : AppCompatActivity() {
 
         val intent = Intent(this, PlayerActivity::class.java)
         startActivity(intent)
+
+        finish()
     }
 
     /**
